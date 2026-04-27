@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+build/
+dist/
+data/
+logs/
+/models/
+wheels/
+*.egg-info
+
+*.onnx
+*.plan
+*.cache
+/examples/models/*/models/*
+
+# Virtual environments
+.venv

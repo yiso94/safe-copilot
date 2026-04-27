@@ -1,0 +1,1 @@
+cd /workspaces/SAfe && /workspaces/SAfe/.venv/bin/python /workspaces/SAfe/src/a.py > test.log 2>&1

@@ -1,0 +1,45 @@
+{
+    "name": "SAFe-Copilot-dev",
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+    "init": true,
+    "build": {
+        "dockerfile": "./Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Python-related extensions
+                "ms-python.python",
+                "charliermarsh.ruff",
+                "njpwerner.autodocstring",
+                //jupyter
+                "ms-toolsai.jupyter",
+                // markdown
+                "davidanson.vscode-markdownlint",
+                // utils
+                "oderwat.indent-rainbow",
+                "streetsidesoftware.code-spell-checker",
+                "usernamehw.errorlens",
+                "gruntfuggly.todo-tree",
+                "christian-kohler.path-intellisense",
+                // git
+                "eamodio.gitlens",
+                // AI
+                "openai.chatgpt"
+            ]
+        }
+    },
+    "features": {
+        "ghcr.io/va-h/devcontainers-features/uv:1": {
+            "version": "latest"
+        },
+        "ghcr.io/devcontainers/features/git:1": {
+            "version": "latest",
+            "ppa": "true"
+        }
+    },
+    "postCreateCommand": "bash .devcontainer/Setup.sh"
+}

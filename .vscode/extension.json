@@ -1,0 +1,17 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "detachhead.basedpyright",
+    "charliermarsh.ruff",
+    "njpwerner.autodocstring",
+    "davidanson.vscode-markdownlint",
+    "oderwat.indent-rainbow",
+    "streetsidesoftware.code-spell-checker",
+    "usernamehw.errorlens",
+    "gruntfuggly.todo-tree",
+    "christian-kohler.path-intellisense",
+    "eamodio.gitlens",
+    "github.vscode-pull-request-github"
+  ],
+  "unwantedRecommendations": []
+}

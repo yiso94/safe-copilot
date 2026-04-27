@@ -1,0 +1,116 @@
+[project]
+name = "safe_copilot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "ruff>=0.15.5",
+    "safe-copilot",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+flash-attn = { path = "dist/flash_attn-2.8.3-cp310-cp310-linux_x86_64.whl" }
+navsim = { git = "https://github.com/yiso94/recogdrive.git" }
+safe-copilot = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    ".",
+    ".",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[tool.pyright]
+typeCheckingMode = "basic"
+include = [
+    "src",
+    "tests",
+    "examples",
+]
+venvPath = "."
+venv = ".venv"
+executionEnvironments = [
+    { root = "tests", extraPaths = [
+        ".",
+    ], reportUnusedFunction = false, reportPrivateUsage = false },
+    { root = "examples", reportUnusedFunction = false },
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["README.md"]
+
+[tool.ruff.lint]
+select = [
+    "C4",     # flake8-comprehensions
+    "C90",    # mccabe
+    "D212",   # pydocstyle: multi-line docstring summary should start at the first line
+    "E",      # pycodestyle
+    "F",      # pyflakes
+    "I",      # isort
+    "PERF",   # Perflint
+    "UP",     # pyupgrade
+    "TID251", # https://docs.astral.sh/ruff/rules/banned-api/
+]
+ignore = ["PERF203"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pydantic.RootModel".msg = "Use `pydantic.TypeAdapter` instead."
+
+[tool.ruff.lint.mccabe]
+max-complexity = 24 # Default is 10
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.pylint]
+allow-magic-value-types = ["bytes", "float", "int", "str"]
+max-args = 23                                              # Default is 5
+max-branches = 23                                          # Default is 12
+max-returns = 13                                           # Default is 6
+max-statements = 102                                       # Default is 50
+
+[tool.markdown.lint]
+default = true
+MD004 = false    # ul-style - Unordered list style
+MD007.indent = 2 # ul-indent - Unordered list indentation
+MD013 = false    # line-length - Line length
+MD029 = false    # ol-prefix - Ordered list item prefix
+MD033 = false    # no-inline-html Inline HTML
+MD041 = false    # first-line-heading/first-line-h1
+MD046 = false    # indented-code-blocks
+MD059 = false    # descriptive-link-text
+
+[tool.inline-snapshot]
+default-flags = ["disable"]
+format-command = "ruff format --stdin-filename {filename}"
