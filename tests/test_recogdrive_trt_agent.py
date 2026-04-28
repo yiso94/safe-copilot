@@ -479,6 +479,73 @@ def test_recogdrive_diffusion_trt_matches_recogdrive_action_head(tmp_path: Path)
         )
         trt_predictions = trt_agent.forward(
             _clone_features(features),
+            init_actions=init_actions.clone(),
+        )
+
+    assert torch.allclose(
+        reference_predictions["pred_traj"],
+        trt_predictions["pred_traj"],
+        atol=DIFFUSION_TRAJECTORY_ATOL,
+        rtol=DIFFUSION_TRAJECTORY_RTOL,
+    )
+
+    _release_cuda_memory(reference_agent, trt_agent)
+
+
+def test_safe_copilot_safe_agent_uses_created_diffusion_engine(tmp_path: Path) -> None:
+    diffusion_engine_path = REPO_ROOT / "models" / "diffusion_denoising_step_fp16.plan"
+    diffusion_metadata_path = diffusion_engine_path.with_suffix(".metadata.json")
+    if not diffusion_engine_path.exists():
+        pytest.skip(
+            "SAFE diffusion denoising-step TRT engine is missing. Build it with "
+            "`examples/models/diffusion_planner/diffusion_onnx_trt.py` first."
+        )
+    if not diffusion_metadata_path.exists():
+        pytest.skip(f"SAFE diffusion denoising-step metadata is missing: {diffusion_metadata_path}")
+
+    image_path = _create_test_image(tmp_path)
+    features = _make_feature_batch(image_path)
+    features["last_hidden_state"] = _make_cached_hidden_state()
+    init_actions = _make_init_actions()
+    trajectory_sampling = sys.modules["nuplan.planning.simulation.trajectory.trajectory_sampling"].TrajectorySampling(
+        num_poses=8
+    )
+
+    reference_agent = (
+        SafeCopilotReCogDriveAgent(
+            trajectory_sampling=trajectory_sampling,
+            checkpoint_path=str(rv.DIFFUSION_CHECKPOINT),
+            cache_mode=False,
+            cache_hidden_state=True,
+            dit_type="small",
+        )
+        .eval()
+        .cuda()
+    )
+    trt_agent = (
+        SafeCopilotReCogDriveAgentTRT(
+            trajectory_sampling=trajectory_sampling,
+            checkpoint_path=str(rv.DIFFUSION_CHECKPOINT),
+            cache_mode=False,
+            cache_hidden_state=True,
+            dit_type="small",
+            diffusion_engine_path=diffusion_engine_path,
+            diffusion_metadata_path=diffusion_metadata_path,
+        )
+        .eval()
+        .cuda()
+    )
+    reference_agent.initialize()
+    trt_agent.initialize()
+
+    with torch.inference_mode():
+        reference_predictions = reference_agent.forward(
+            _clone_features(features),
+            deterministic=True,
+            init_actions=init_actions.clone(),
+        )
+        trt_predictions = trt_agent.forward(
+            _clone_features(features),
             deterministic=True,
             init_actions=init_actions.clone(),
         )

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
-from transformers.feature_extraction_utils import BatchFeature
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+from transformers.feature_extraction_utils import BatchFeature
 
 from .recogdrive_agent import ReCogDriveAgent
 from .recogdrive_diffusion_planner_trt import ReCogDriveDiffusionPlannerTRT
@@ -15,19 +14,19 @@ class ReCogDriveTRTAgent(ReCogDriveAgent):
     def __init__(
         self,
         trajectory_sampling: TrajectorySampling,
-        vlm_path: Optional[str] = None,
-        checkpoint_path: Optional[str] = None,
-        cam_type: Optional[str] = 'single',
-        vlm_type: Optional[str] = 'internvl',
-        dit_type: Optional[str] = 'small',
-        sampling_method: Optional[str] = 'ddim',
+        vlm_path: str | None = None,
+        checkpoint_path: str | None = None,
+        cam_type: str | None = 'single',
+        vlm_type: str | None = 'internvl',
+        dit_type: str | None = 'small',
+        sampling_method: str | None = 'ddim',
         cache_mode: bool = False,
         cache_hidden_state: bool = False,
         lr: float = 1e-4,
         grpo: bool = False,
-        metric_cache_path: Optional[str] = '',
-        reference_policy_checkpoint: Optional[str] = '',
-        vlm_size: Optional[str] = 'small',
+        metric_cache_path: str | None = '',
+        reference_policy_checkpoint: str | None = '',
+        vlm_size: str | None = 'small',
         train_backbone: bool = False,
         vision_engine_path: str | Path | None = None,
         hidden_state_engine_dir: str | Path | None = None,
@@ -109,6 +108,7 @@ class ReCogDriveTRTAgent(ReCogDriveAgent):
                 device=self.device,
                 engine_path=self.trt_diffusion_engine_path,
                 metadata_path=self.trt_diffusion_metadata_path,
+                planner=self.action_head,
             )
         return self._action_head_trt
 

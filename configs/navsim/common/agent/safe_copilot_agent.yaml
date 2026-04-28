@@ -13,7 +13,7 @@ vlm_type: 'internvl'
 dit_type: 'small'
 sampling_method: 'ddim'
 cache_mode: False
-cache_hidden_state: True
+cache_hidden_state: False
 metric_cache_path: ''
 reference_policy_checkpoint: ''
 vlm_size: 'small'

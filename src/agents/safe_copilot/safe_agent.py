@@ -1,5 +1,5 @@
 import os
-import time
+from pathlib import Path
 
 import torch
 import torch.optim as optim
@@ -13,6 +13,7 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import AgentInput, SensorConfig, Trajectory
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 
+from ..recogdrive.recogdrive_diffusion_planner_trt import ReCogDriveDiffusionPlannerTRT
 from .recogdrive_diffusion_planner import (
     ReCogDriveDiffusionPlanner,
     ReCogDriveDiffusionPlannerConfig,
@@ -22,6 +23,13 @@ from .safe_backbone import SAFeCopilotBackbone
 from .utils.internvl_preprocess import load_image
 from .utils.lr_scheduler import WarmupCosLR
 from .utils.utils import build_from_configs, format_number
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_VISION_ENGINE_PATH = REPO_ROOT / "models" / "vision_projector_bf16.plan"
+DEFAULT_QWEN_ENGINE_DIR = REPO_ROOT / "models" / "qwen_bf16"
+DEFAULT_DIFFUSION_ENGINE_PATH = REPO_ROOT / "models" / "diffusion_denoising_step_fp16.plan"
+DEFAULT_DIFFUSION_METADATA_PATH = DEFAULT_DIFFUSION_ENGINE_PATH.with_suffix(".metadata.json")
+DEFAULT_VLM_MODEL_SOURCE = "owl10/ReCogDrive-VLM-2B"
 
 
 class ReCogDriveAgent(AbstractAgent):
@@ -42,6 +50,17 @@ class ReCogDriveAgent(AbstractAgent):
         reference_policy_checkpoint: str | None = "",
         vlm_size: str | None = "small",
         train_backbone: bool = False,
+        vision_engine_path: str | Path | None = None,
+        hidden_state_engine_dir: str | Path | None = None,
+        qwen_engine_dir: str | Path | None = None,
+        llm_dir: str | Path | None = None,
+        hidden_state_max_input_len: int = 2800,
+        hidden_state_max_prompt_embedding_table_size: int = 3328,
+        hidden_state_remove_input_padding: bool = False,
+        hidden_state_gpt_attention_plugin: str | None = None,
+        diffusion_engine_path: str | Path | None = DEFAULT_DIFFUSION_ENGINE_PATH,
+        diffusion_metadata_path: str | Path | None = DEFAULT_DIFFUSION_METADATA_PATH,
+        use_diffusion_trt: bool | None = None,
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -58,18 +77,37 @@ class ReCogDriveAgent(AbstractAgent):
         self.reference_policy_checkpoint = reference_policy_checkpoint
         self.vlm_size = vlm_size
         self.train_backbone = train_backbone
+        self.trt_vision_engine_path = (
+            Path(vision_engine_path) if vision_engine_path is not None else DEFAULT_VISION_ENGINE_PATH
+        )
+        hidden_state_engine_dir = hidden_state_engine_dir if hidden_state_engine_dir is not None else qwen_engine_dir
+        self.trt_hidden_state_engine_dir = (
+            Path(hidden_state_engine_dir) if hidden_state_engine_dir is not None else DEFAULT_QWEN_ENGINE_DIR
+        )
+        self.trt_llm_dir = Path(llm_dir) if llm_dir is not None else None
+        self.trt_hidden_state_max_input_len = hidden_state_max_input_len
+        self.trt_hidden_state_max_prompt_embedding_table_size = hidden_state_max_prompt_embedding_table_size
+        self.trt_hidden_state_remove_input_padding = hidden_state_remove_input_padding
+        self.trt_hidden_state_gpt_attention_plugin = hidden_state_gpt_attention_plugin
+        self.trt_diffusion_engine_path = Path(diffusion_engine_path) if diffusion_engine_path is not None else None
+        self.trt_diffusion_metadata_path = (
+            Path(diffusion_metadata_path) if diffusion_metadata_path is not None else None
+        )
+        self.use_diffusion_trt = use_diffusion_trt
+        self._action_head_trt: ReCogDriveDiffusionPlannerTRT | None = None
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
         self.device = device
         if not self.cache_hidden_state and not self.cache_mode:
             print("Agent running in 'no-cache' mode. Initializing internal backbone.")
-            if not self.vlm_path or not self.vlm_type:
-                raise ValueError("In 'no-cache' mode, vlm_path and vlm_type are required.")
+            if not self.vlm_type:
+                raise ValueError("In 'no-cache' mode, vlm_type is required.")
+            model_source = str(self.trt_llm_dir or self.vlm_path or DEFAULT_VLM_MODEL_SOURCE)
             self.backbone = SAFeCopilotBackbone(
-                vit_engine_path="./models/vision_projector_bf16.plan",
-                qwen_engine_dir="./models/qwen_bf16",
-                checkpoint_path="owl10/ReCogDrive-VLM-2B",
+                vit_engine_path=self.trt_vision_engine_path,
+                qwen_engine_dir=self.trt_hidden_state_engine_dir,
+                checkpoint_path=model_source,
                 device=device,
             )
 
@@ -133,7 +171,15 @@ class ReCogDriveAgent(AbstractAgent):
             )
         ]
 
-    def forward(self, features: dict[str, torch.Tensor], targets=None, tokens_list=None) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        targets=None,
+        tokens_list=None,
+        *,
+        deterministic: bool = False,
+        init_actions: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         for key, tensor in features.items():
             if isinstance(tensor, torch.Tensor):
                 features[key] = tensor.cuda()
@@ -196,9 +242,7 @@ class ReCogDriveAgent(AbstractAgent):
                 )
                 questions.append(f"{prompt}{output_requirements}")
 
-            start = time.time()
             outputs = self.backbone(pixel_values_cat, questions, num_patches_list=num_patches_list)
-            print(f"Inference time for backbone forward pass: {time.time() - start:.2f} seconds")
             last_hidden_state = outputs.hidden_states[-1]
 
         status_feature = features["status_feature"].cuda()
@@ -239,7 +283,12 @@ class ReCogDriveAgent(AbstractAgent):
                     "status_feature": status_feature.to(model_dtype),
                 }
             )
-            return self.action_head.get_action(last_hidden_state.to(model_dtype), action_inputs)
+            return self._run_inference_action_head(
+                last_hidden_state.to(model_dtype),
+                action_inputs,
+                deterministic=deterministic,
+                init_actions=init_actions,
+            )
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         self.eval()
@@ -284,7 +333,7 @@ class ReCogDriveAgent(AbstractAgent):
             return torch.nn.functional.l1_loss(predictions["pred_traj"], targets["trajectory"])
 
     def get_optimizers(self) -> Optimizer | dict[str, LRScheduler]:
-        optimizer_cfg = DictConfig(dict(type="AdamW", lr=self._lr, weight_decay=1e-4, betas=(0.9, 0.95)))
+        optimizer_cfg = DictConfig({"type": "AdamW", "lr": self._lr, "weight_decay": 1e-4, "betas": (0.9, 0.95)})
 
         params = list(self.action_head.parameters())
         if self.backbone is not None and self.train_backbone:
@@ -321,11 +370,98 @@ class ReCogDriveAgent(AbstractAgent):
             decoded_paths.append("".join(chars))
         return decoded_paths
 
+    def _should_use_diffusion_trt(self) -> bool:
+        if self.use_diffusion_trt is not None:
+            return self.use_diffusion_trt
+        return self.trt_diffusion_engine_path is not None and self.trt_diffusion_engine_path.exists()
+
+    def _get_action_head_trt(self) -> ReCogDriveDiffusionPlannerTRT:
+        if self.trt_diffusion_engine_path is None:
+            raise FileNotFoundError("Diffusion TRT engine path is not configured.")
+        if self._action_head_trt is None:
+            self._action_head_trt = ReCogDriveDiffusionPlannerTRT(
+                device=self.device,
+                engine_path=self.trt_diffusion_engine_path,
+                metadata_path=self.trt_diffusion_metadata_path,
+                planner=self.action_head,
+            )
+        return self._action_head_trt
+
+    def _run_inference_action_head(
+        self,
+        last_hidden_state: torch.Tensor,
+        action_inputs: BatchFeature,
+        *,
+        deterministic: bool = False,
+        init_actions: torch.Tensor | None = None,
+    ) -> BatchFeature:
+        if init_actions is not None:
+            init_actions = init_actions.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
+
+        if self._should_use_diffusion_trt():
+            return self._get_action_head_trt().get_action(
+                last_hidden_state,
+                action_inputs,
+                init_actions=init_actions,
+                deterministic=True,
+            )
+
+        if self.use_diffusion_trt:
+            raise FileNotFoundError(
+                f"Diffusion TRT engine was requested but was not found at {self.trt_diffusion_engine_path}."
+            )
+        return self.action_head.get_action(
+            last_hidden_state,
+            action_inputs,
+            init_actions=init_actions,
+            deterministic=deterministic,
+        )
+
 
 class SAFeCopilotAgent(ReCogDriveAgent):
     """Hydra-facing alias that preserves the expected SAFE agent target path."""
 
-    pass
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("cache_hidden_state", False)
+        kwargs.setdefault("use_diffusion_trt", True)
+        kwargs.setdefault("vision_engine_path", DEFAULT_VISION_ENGINE_PATH)
+        kwargs.setdefault("hidden_state_engine_dir", DEFAULT_QWEN_ENGINE_DIR)
+        kwargs.setdefault("diffusion_engine_path", DEFAULT_DIFFUSION_ENGINE_PATH)
+        kwargs.setdefault("diffusion_metadata_path", DEFAULT_DIFFUSION_METADATA_PATH)
+        super().__init__(*args, **kwargs)
+
+
+class ReCogDriveAgentTRT(ReCogDriveAgent):
+    """SAFE agent variant that uses TRT backbones and the diffusion step engine."""
+
+    def __init__(
+        self,
+        trajectory_sampling: TrajectorySampling | None = None,
+        **kwargs,
+    ):
+        if trajectory_sampling is None:
+            trajectory_sampling = TrajectorySampling(num_poses=8)
+        kwargs.setdefault("cache_hidden_state", False)
+        kwargs.setdefault("use_diffusion_trt", True)
+        kwargs.setdefault("vision_engine_path", DEFAULT_VISION_ENGINE_PATH)
+        kwargs.setdefault("hidden_state_engine_dir", DEFAULT_QWEN_ENGINE_DIR)
+        kwargs.setdefault("diffusion_engine_path", DEFAULT_DIFFUSION_ENGINE_PATH)
+        kwargs.setdefault("diffusion_metadata_path", DEFAULT_DIFFUSION_METADATA_PATH)
+        kwargs.setdefault("vlm_path", str(kwargs.get("llm_dir") or DEFAULT_VLM_MODEL_SOURCE))
+        super().__init__(trajectory_sampling=trajectory_sampling, **kwargs)
+
+    def predict_pred_traj(
+        self,
+        features: dict[str, torch.Tensor],
+        *,
+        deterministic: bool = True,
+        init_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward(
+            features,
+            deterministic=deterministic,
+            init_actions=init_actions,
+        )["pred_traj"]
 
 
 def make_recogdrive_config(

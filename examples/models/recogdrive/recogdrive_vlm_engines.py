@@ -40,7 +40,7 @@ DIFFUSION_DIR = ROOT / "diffusion_trt"
 DIFFUSION_ONNX = DIFFUSION_DIR / "diffusion_planner.onnx"
 DIFFUSION_PLAN = DIFFUSION_DIR / "diffusion_planner.plan"
 DIFFUSION_METADATA = DIFFUSION_DIR / "metadata.json"
-DIFFUSION_ENGINE_INTERFACE_VERSION = 2
+DIFFUSION_ENGINE_INTERFACE_VERSION = 3
 DIFFUSION_CHECKPOINT = Path(
     os.getenv(
         "RECOGDRIVE_DIFFUSION_CHECKPOINT",
@@ -58,72 +58,31 @@ class VisionProjectorWrapper(torch.nn.Module):
         return self.model.extract_feature(pixel_values)
 
 
-class DiffusionPlannerWrapper(torch.nn.Module):
+class DiffusionDenoisingStepWrapper(torch.nn.Module):
     def __init__(self, planner: torch.nn.Module):
         super().__init__()
         self.planner = planner
 
     def forward(
         self,
-        vl_features: torch.Tensor,
-        his_traj: torch.Tensor,
-        status_feature: torch.Tensor,
-        init_actions: torch.Tensor,
+        current_actions: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        history_embeds: torch.Tensor,
+        ego_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
     ) -> torch.Tensor:
         planner = self.planner
-        vl_embeds = planner.feature_encoder(vl_features)
-        history_embeds = planner.his_traj_encoder(his_traj.unsqueeze(1)).repeat(
-            1, planner.config.action_horizon, 1
+        action_features = planner.action_encoder(current_actions, timesteps)
+        if hasattr(planner, "position_embedding"):
+            position_ids = torch.arange(planner.config.action_horizon, device=current_actions.device)
+            action_features = action_features + planner.position_embedding(position_ids)
+
+        vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, planner.config.action_horizon, 1)
+        fused_input = planner.fusion_projector(
+            torch.cat((history_embeds, vl_embeds_mean, action_features), dim=2)
         )
-        ego_embeds = planner.ego_status_encoder(status_feature)
-        current_actions = init_actions
-        batch_size = current_actions.shape[0]
-        device = current_actions.device
-
-        if planner.config.sampling_method == "flow":
-            dt = 1.0 / planner.config.num_inference_steps
-            for step in range(planner.config.num_inference_steps):
-                bucket_index = int(
-                    step / planner.config.num_inference_steps * planner.config.flow_cfg.num_timestep_buckets
-                )
-                timestep = torch.full((batch_size,), bucket_index, device=device, dtype=torch.long)
-                action_features = planner.action_encoder(current_actions, timestep)
-                if hasattr(planner, "position_embedding"):
-                    position_ids = torch.arange(planner.config.action_horizon, device=device)
-                    action_features = action_features + planner.position_embedding(position_ids)
-                vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, planner.config.action_horizon, 1)
-                fused_input = planner.fusion_projector(
-                    torch.cat((history_embeds, vl_embeds_mean, action_features), dim=2)
-                )
-                model_output = planner.model(fused_input, vl_embeds, ego_embeds, timestep)
-                predicted_flow = planner.action_decoder(model_output)
-                if planner.config.flow_cfg.mean_variance_net:
-                    predicted_flow = predicted_flow.chunk(2, dim=-1)[0]
-                current_actions = current_actions + dt * predicted_flow
-        elif planner.config.sampling_method == "ddim":
-            for step_index in range(planner.ddim_steps):
-                timestep_value = int(planner.ddim_t[step_index].item())
-                timestep = torch.full((batch_size,), timestep_value, device=device, dtype=torch.long)
-                schedule_index = torch.full((batch_size,), step_index, device=device, dtype=torch.long)
-                mean, _, _ = planner.p_mean_variance(
-                    current_actions,
-                    timestep,
-                    schedule_index,
-                    vl_embeds,
-                    history_embeds,
-                    ego_embeds,
-                    deterministic=True,
-                )
-                current_actions = mean
-        else:
-            raise NotImplementedError(
-                "The TensorRT diffusion export currently supports only 'ddim' and 'flow' sampling."
-            )
-
-        final_action_clip_value = getattr(planner, "final_action_clip_value", 1.0)
-        if final_action_clip_value is not None:
-            current_actions = current_actions.clamp(-final_action_clip_value, final_action_clip_value)
-        return planner.denorm_odo(current_actions)
+        model_output = planner.model(fused_input, vl_embeds, ego_embeds, timesteps)
+        return planner.action_decoder(model_output)
 
 
 @dataclass
@@ -135,6 +94,7 @@ class _DiffusionPlannerSpec:
     his_traj_dim: int
     status_feature_dim: int
     action_dim: int
+    model_prediction_dim: int
     action_horizon: int
     num_heads: int
     head_dim: int
@@ -329,13 +289,13 @@ def _device_from_device_map(device_map) -> torch.device:
 
 def load_reference_model(device_map="cuda:0", *, use_flash_attn: bool = True):
     source = resolve_model_source()
-    base_kwargs = dict(
-        dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        use_flash_attn=use_flash_attn,
-        local_files_only=_local_files_only(),
-    )
+    base_kwargs = {
+        "dtype": torch.bfloat16,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+        "use_flash_attn": use_flash_attn,
+        "local_files_only": _local_files_only(),
+    }
 
     try:
         return AutoModel.from_pretrained(source, device_map=device_map, **base_kwargs).eval()
@@ -345,10 +305,10 @@ def load_reference_model(device_map="cuda:0", *, use_flash_attn: bool = True):
 
 
 def _load_tokenizer_from_source(source: str, llm_config=None):
-    kwargs = dict(
-        trust_remote_code=True,
-        local_files_only=_local_files_only(),
-    )
+    kwargs = {
+        "trust_remote_code": True,
+        "local_files_only": _local_files_only(),
+    }
     if llm_config is not None:
         kwargs["config"] = llm_config
 
@@ -456,7 +416,8 @@ def _infer_diffusion_planner_spec(
     hidden_size = state_dict["his_traj_encoder.fc1.weight"].shape[0]
     his_traj_dim = state_dict["his_traj_encoder.fc1.weight"].shape[1]
     status_feature_dim = state_dict["ego_status_encoder.fc1.weight"].shape[1]
-    action_dim = int(state_dict["action_decoder.fc2.bias"].numel())
+    action_dim = int(state_dict["action_encoder.fc1.weight"].shape[1])
+    model_prediction_dim = int(state_dict["action_decoder.fc2.bias"].numel())
     action_horizon = int(state_dict["position_embedding.weight"].shape[0])
     output_dim, inner_dim = state_dict["model.final_layer.linear.weight"].shape
     head_dim = int(state_dict["model.rotary_embedder.inv_freq"].numel() * 2)
@@ -477,6 +438,7 @@ def _infer_diffusion_planner_spec(
         his_traj_dim=his_traj_dim,
         status_feature_dim=status_feature_dim,
         action_dim=action_dim,
+        model_prediction_dim=model_prediction_dim,
         action_horizon=action_horizon,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -714,42 +676,60 @@ def export_diffusion_onnx(
         sampling_method=sampling_method,
     )
     _disable_compiled_modulate_methods_for_export(planner)
-    wrapper = DiffusionPlannerWrapper(planner).eval().cuda()
-    example_vl_features = torch.zeros(
-        1,
-        min(max_vl_seq_len, max(spec.action_horizon, 256)),
-        spec.feature_dim,
-        device="cuda",
-        dtype=torch.float16,
-    )
-    example_his_traj = torch.zeros(1, spec.his_traj_dim, device="cuda", dtype=torch.float16)
-    example_status_feature = torch.zeros(
-        1,
-        spec.status_feature_dim,
-        device="cuda",
-        dtype=torch.float16,
-    )
-    example_init_actions = torch.zeros(
+    wrapper = DiffusionDenoisingStepWrapper(planner).eval().cuda()
+    example_current_actions = torch.zeros(
         1,
         spec.action_horizon,
         spec.action_dim,
         device="cuda",
         dtype=torch.float16,
     )
+    example_vl_embeds = torch.zeros(
+        1,
+        min(max_vl_seq_len, max(spec.action_horizon, 256)),
+        spec.input_embedding_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_history_embeds = torch.zeros(
+        1,
+        spec.action_horizon,
+        spec.input_embedding_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_ego_embeds = torch.zeros(
+        1,
+        spec.input_embedding_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_timesteps = torch.zeros(1, device="cuda", dtype=torch.int32)
 
     with torch.inference_mode():
         torch.onnx.export(
             wrapper,
-            (example_vl_features, example_his_traj, example_status_feature, example_init_actions),
+            (
+                example_current_actions,
+                example_vl_embeds,
+                example_history_embeds,
+                example_ego_embeds,
+                example_timesteps,
+            ),
             str(DIFFUSION_ONNX),
-            input_names=["vl_features", "his_traj", "status_feature", "init_actions"],
-            output_names=["pred_traj"],
+            input_names=["current_actions", "vl_embeds", "history_embeds", "ego_embeds", "timesteps"],
+            output_names=["model_prediction"],
             opset_version=18,
             dynamo=False,
             external_data=True,
             do_constant_folding=False,
             dynamic_axes={
-                "vl_features": {1: "vl_seq_len"},
+                "current_actions": {0: "batch"},
+                "vl_embeds": {0: "batch", 1: "vl_seq_len"},
+                "history_embeds": {0: "batch"},
+                "ego_embeds": {0: "batch"},
+                "timesteps": {0: "batch"},
+                "model_prediction": {0: "batch"},
             },
         )
 
@@ -761,10 +741,12 @@ def export_diffusion_onnx(
                 "max_vl_seq_len": max_vl_seq_len,
                 "sampling_method": sampling_method,
                 "feature_dim": spec.feature_dim,
+                "input_embedding_dim": spec.input_embedding_dim,
                 "his_traj_dim": spec.his_traj_dim,
                 "status_feature_dim": spec.status_feature_dim,
                 "action_horizon": spec.action_horizon,
                 "action_dim": spec.action_dim,
+                "model_prediction_dim": spec.model_prediction_dim,
             },
             indent=2,
         )
@@ -814,29 +796,30 @@ def build_diffusion_trt_engine(
         config.set_flag(trt.BuilderFlag.FP16)
         profile = builder.create_optimization_profile()
         profile.set_shape(
-            "vl_features",
-            (1, 1, spec.feature_dim),
-            (1, min(max_vl_seq_len, max(spec.action_horizon, 256)), spec.feature_dim),
-            (1, max_vl_seq_len, spec.feature_dim),
-        )
-        profile.set_shape(
-            "his_traj",
-            (1, spec.his_traj_dim),
-            (1, spec.his_traj_dim),
-            (1, spec.his_traj_dim),
-        )
-        profile.set_shape(
-            "status_feature",
-            (1, spec.status_feature_dim),
-            (1, spec.status_feature_dim),
-            (1, spec.status_feature_dim),
-        )
-        profile.set_shape(
-            "init_actions",
+            "current_actions",
             (1, spec.action_horizon, spec.action_dim),
             (1, spec.action_horizon, spec.action_dim),
             (1, spec.action_horizon, spec.action_dim),
         )
+        profile.set_shape(
+            "vl_embeds",
+            (1, 1, spec.input_embedding_dim),
+            (1, min(max_vl_seq_len, max(spec.action_horizon, 256)), spec.input_embedding_dim),
+            (1, max_vl_seq_len, spec.input_embedding_dim),
+        )
+        profile.set_shape(
+            "history_embeds",
+            (1, spec.action_horizon, spec.input_embedding_dim),
+            (1, spec.action_horizon, spec.input_embedding_dim),
+            (1, spec.action_horizon, spec.input_embedding_dim),
+        )
+        profile.set_shape(
+            "ego_embeds",
+            (1, spec.input_embedding_dim),
+            (1, spec.input_embedding_dim),
+            (1, spec.input_embedding_dim),
+        )
+        profile.set_shape("timesteps", (1,), (1,), (1,))
         config.add_optimization_profile(profile)
         serialized = builder.build_serialized_network(network, config)
     finally:

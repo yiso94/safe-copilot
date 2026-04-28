@@ -2,6 +2,7 @@ import logging
 import lzma
 import os
 import pickle
+import time
 import traceback
 import uuid
 from dataclasses import asdict
@@ -107,11 +108,14 @@ def run_pdm_score(args: list[dict[str, list[str] | DictConfig]]) -> list[dict[st
 
             requires_scene = False
             agent_input = scene_loader.get_agent_input_from_token(token)
+            start_time = time.time()
             if requires_scene:
                 scene = scene_loader.get_scene_from_token(token)
                 trajectory = agent.compute_trajectory(agent_input, scene)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
+            end_time = time.time()
+            print(f"Agent inference time : {end_time - start_time:.2f} seconds")
             pdm_result = pdm_score(
                 metric_cache=metric_cache,
                 model_trajectory=trajectory,
