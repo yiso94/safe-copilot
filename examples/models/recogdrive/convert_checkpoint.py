@@ -6,8 +6,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from recogdrive.recogdrive_vlm_engines import (
+from recogdrive.recogdrive_vlm_engines import (  # noqa: E402
     build_diffusion_trt_engine,
+    build_full_diffusion_trt_engine,
     build_language_generation_trtllm_engine,
     build_language_trtllm_engine,
     build_vision_trt_engine,
@@ -27,6 +28,7 @@ def main() -> None:
         os.getenv("DIFFUSION_MAX_VL_SEQ_LEN", str(hidden_state_max_input_len))
     )
     diffusion_sampling_method = os.getenv("RECOGDRIVE_DIFFUSION_SAMPLING_METHOD", "ddim")
+    diffusion_engine_kind = os.getenv("RECOGDRIVE_DIFFUSION_ENGINE_KIND", "full_diffusion")
     generation_max_input_len = int(os.getenv("GENERATION_MAX_INPUT_LEN", "1024"))
     generation_max_output_len = int(os.getenv("GENERATION_MAX_OUTPUT_LEN", "128"))
     generation_max_prompt_embedding_table_size = int(os.getenv("GENERATION_MAX_PROMPT_EMBEDDING_TABLE_SIZE", "3072"))
@@ -38,10 +40,18 @@ def main() -> None:
         remove_input_padding=hidden_state_remove_input_padding,
         gpt_attention_plugin=hidden_state_gpt_attention_plugin,
     )
-    diffusion = build_diffusion_trt_engine(
-        max_vl_seq_len=diffusion_max_vl_seq_len,
-        sampling_method=diffusion_sampling_method,
-    )
+    if diffusion_engine_kind == "full_diffusion":
+        diffusion = build_full_diffusion_trt_engine(
+            max_vl_seq_len=diffusion_max_vl_seq_len,
+            sampling_method=diffusion_sampling_method,
+        )
+    elif diffusion_engine_kind == "denoising_step":
+        diffusion = build_diffusion_trt_engine(
+            max_vl_seq_len=diffusion_max_vl_seq_len,
+            sampling_method=diffusion_sampling_method,
+        )
+    else:
+        raise ValueError(f"Unsupported RECOGDRIVE_DIFFUSION_ENGINE_KIND={diffusion_engine_kind!r}")
     generation = build_language_generation_trtllm_engine(
         max_input_len=generation_max_input_len,
         max_output_len=generation_max_output_len,

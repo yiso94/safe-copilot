@@ -86,6 +86,9 @@ class ReCogDriveDiffusionPlannerTRT:
                 "examples/models/recogdrive/convert_checkpoint.py."
             )
 
+        self.engine_kind = str(metadata.get("engine_kind", "denoising_step"))
+        if self.engine_kind not in {"denoising_step", "full_diffusion"}:
+            raise RuntimeError(f"Unsupported diffusion TRT engine_kind={self.engine_kind!r}")
         self.action_horizon = int(metadata.get("action_horizon", 8))
         self.action_dim = int(metadata.get("action_dim", 3))
         self.his_traj_dim = int(metadata.get("his_traj_dim", 12))
@@ -100,7 +103,7 @@ class ReCogDriveDiffusionPlannerTRT:
             )
         ).expanduser()
         self._source_planner = planner
-        self._planner = self._load_planner()
+        self._planner = self._load_planner() if self.engine_kind == "denoising_step" or planner is not None else None
 
         self._logger = trt.Logger(trt.Logger.WARNING)
         self._runtime = trt.Runtime(self._logger)
@@ -132,16 +135,38 @@ class ReCogDriveDiffusionPlannerTRT:
         if next(planner.parameters()).dtype != torch.float16:
             planner = planner.half()
 
-        # These modules live inside the TRT denoising-step engine. Dropping the
-        # PyTorch copies keeps the runtime from carrying two full DiT graphs.
-        planner.action_encoder = torch.nn.Identity()
-        planner.action_decoder = torch.nn.Identity()
-        planner.fusion_projector = torch.nn.Identity()
-        planner.model = torch.nn.Identity()
-        if hasattr(planner, "position_embedding"):
-            planner.position_embedding = torch.nn.Identity()
+        if self.engine_kind == "full_diffusion":
+            self._release_full_engine_modules(planner)
+        else:
+            # These modules live inside the TRT denoising-step engine. Dropping
+            # the PyTorch copies keeps the runtime from carrying two full DiT graphs.
+            planner.action_encoder = torch.nn.Identity()
+            planner.action_decoder = torch.nn.Identity()
+            planner.fusion_projector = torch.nn.Identity()
+            planner.model = torch.nn.Identity()
+            if hasattr(planner, "position_embedding"):
+                planner.position_embedding = torch.nn.Identity()
         torch.cuda.empty_cache()
         return planner
+
+    def _release_full_engine_modules(self, planner: torch.nn.Module) -> None:
+        for module_name in (
+            "feature_encoder",
+            "his_traj_encoder",
+            "ego_status_encoder",
+            "action_encoder",
+            "action_decoder",
+            "fusion_projector",
+            "model",
+            "position_embedding",
+        ):
+            if hasattr(planner, module_name):
+                setattr(planner, module_name, torch.nn.Identity())
+        if not hasattr(planner, "_trt_dtype_anchor"):
+            planner.register_parameter(
+                "_trt_dtype_anchor",
+                torch.nn.Parameter(torch.empty((), device=self.device, dtype=torch.float16), requires_grad=False),
+            )
 
     def _prepare_inputs(
         self,
@@ -253,6 +278,37 @@ class ReCogDriveDiffusionPlannerTRT:
             raise RuntimeError("TensorRT diffusion denoising-step execution failed")
         return model_prediction
 
+    def _run_full_diffusion(
+        self,
+        vl_features: torch.Tensor,
+        his_traj: torch.Tensor,
+        status_feature: torch.Tensor,
+        init_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        vl_features = vl_features.to(device=self.device, dtype=torch.float16).contiguous()
+        his_traj = his_traj.to(device=self.device, dtype=torch.float16).contiguous()
+        status_feature = status_feature.to(device=self.device, dtype=torch.float16).contiguous()
+        init_actions = init_actions.to(device=self.device, dtype=torch.float16).contiguous()
+
+        self._context.set_input_shape("vl_features", tuple(vl_features.shape))
+        self._context.set_input_shape("his_traj", tuple(his_traj.shape))
+        self._context.set_input_shape("status_feature", tuple(status_feature.shape))
+        self._context.set_input_shape("init_actions", tuple(init_actions.shape))
+        output_shape = tuple(self._context.get_tensor_shape("pred_traj"))
+        output_dtype = _torch_dtype_from_trt(self._engine.get_tensor_dtype("pred_traj"))
+        pred_traj = torch.empty(output_shape, device=self.device, dtype=output_dtype)
+
+        self._context.set_tensor_address("vl_features", vl_features.data_ptr())
+        self._context.set_tensor_address("his_traj", his_traj.data_ptr())
+        self._context.set_tensor_address("status_feature", status_feature.data_ptr())
+        self._context.set_tensor_address("init_actions", init_actions.data_ptr())
+        self._context.set_tensor_address("pred_traj", pred_traj.data_ptr())
+
+        ok = self._context.execute_async_v3(torch.cuda.current_stream(self.device).cuda_stream)
+        if not ok:
+            raise RuntimeError("TensorRT full diffusion planner execution failed")
+        return pred_traj
+
     def _ddim_mean(
         self,
         current_actions: torch.Tensor,
@@ -300,6 +356,18 @@ class ReCogDriveDiffusionPlannerTRT:
         torch.cuda.synchronize(self.device)
 
         with torch.inference_mode():
+            if self.engine_kind == "full_diffusion":
+                pred_traj = self._run_full_diffusion(
+                    vl_features,
+                    his_traj,
+                    status_feature,
+                    init_actions,
+                )
+                torch.cuda.synchronize(self.device)
+                return BatchFeature(data={"pred_traj": pred_traj.float()})
+
+            if self._planner is None:
+                raise RuntimeError("Denoising-step diffusion TRT runtime requires a PyTorch planner.")
             vl_embeds, history_embeds, ego_embeds = self._encode_conditioning(
                 vl_features,
                 his_traj,

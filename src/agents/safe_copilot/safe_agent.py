@@ -27,7 +27,11 @@ from .utils.utils import build_from_configs, format_number
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_VISION_ENGINE_PATH = REPO_ROOT / "models" / "vision_projector_bf16.plan"
 DEFAULT_QWEN_ENGINE_DIR = REPO_ROOT / "models" / "qwen_bf16"
-DEFAULT_DIFFUSION_ENGINE_PATH = REPO_ROOT / "models" / "diffusion_denoising_step_fp16.plan"
+DEFAULT_DIFFUSION_STEP_ENGINE_PATH = REPO_ROOT / "models" / "diffusion_denoising_step_fp16.plan"
+DEFAULT_DIFFUSION_FULL_ENGINE_PATH = REPO_ROOT / "models" / "diffusion_full_planner_fp16.plan"
+DEFAULT_DIFFUSION_ENGINE_PATH = Path(
+    os.getenv("SAFE_COPILOT_DIFFUSION_ENGINE_PATH", str(DEFAULT_DIFFUSION_FULL_ENGINE_PATH))
+)
 DEFAULT_DIFFUSION_METADATA_PATH = DEFAULT_DIFFUSION_ENGINE_PATH.with_suffix(".metadata.json")
 DEFAULT_VLM_MODEL_SOURCE = "owl10/ReCogDrive-VLM-2B"
 

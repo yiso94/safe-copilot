@@ -108,7 +108,7 @@ class ReCogDriveAgent(AbstractAgent):
 
     def initialize(self) -> None:
         if self.checkpoint_path:
-            ckpt = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
+            ckpt = torch.load(self.checkpoint_path, map_location="cpu")["state_dict"]
             model_dict = self.state_dict()
             filtered_ckpt = {}
             for k, v in ckpt.items():

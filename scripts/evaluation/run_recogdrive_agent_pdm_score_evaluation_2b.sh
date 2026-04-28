@@ -24,6 +24,8 @@ export CUDA_LAUNCH_BLOCKING=1
 
 
 CHECKPOINT="./examples/models/diffusion_planner/models/ReCogDrive_Diffusion_Planner_2B_RL.ckpt"
+DIFFUSION_ENGINE=${DIFFUSION_ENGINE:-"./models/diffusion_full_planner_fp16.plan"}
+DIFFUSION_METADATA=${DIFFUSION_METADATA:-"./models/diffusion_full_planner_fp16.metadata.json"}
 
 
 # 1. Set NAVSIM dataset and related environment variables
@@ -46,5 +48,7 @@ uv run torchrun \
     agent.dit_type="small" \
     agent.vlm_size="small" \
     agent.sampling_method="ddim" \
+    +agent.use_diffusion_trt=True \
+    +agent.diffusion_engine_path="'$DIFFUSION_ENGINE'" \
+    +agent.diffusion_metadata_path="'$DIFFUSION_METADATA'" \
     experiment_name=recogdrive_agent_eval
-

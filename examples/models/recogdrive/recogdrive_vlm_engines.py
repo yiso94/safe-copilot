@@ -40,6 +40,9 @@ DIFFUSION_DIR = ROOT / "diffusion_trt"
 DIFFUSION_ONNX = DIFFUSION_DIR / "diffusion_planner.onnx"
 DIFFUSION_PLAN = DIFFUSION_DIR / "diffusion_planner.plan"
 DIFFUSION_METADATA = DIFFUSION_DIR / "metadata.json"
+DIFFUSION_FULL_ONNX = DIFFUSION_DIR / "diffusion_full_planner.onnx"
+DIFFUSION_FULL_PLAN = DIFFUSION_DIR / "diffusion_full_planner.plan"
+DIFFUSION_FULL_METADATA = DIFFUSION_DIR / "full_metadata.json"
 DIFFUSION_ENGINE_INTERFACE_VERSION = 3
 DIFFUSION_CHECKPOINT = Path(
     os.getenv(
@@ -83,6 +86,138 @@ class DiffusionDenoisingStepWrapper(torch.nn.Module):
         )
         model_output = planner.model(fused_input, vl_embeds, ego_embeds, timesteps)
         return planner.action_decoder(model_output)
+
+
+class DiffusionFullPlannerWrapper(torch.nn.Module):
+    def __init__(self, planner: torch.nn.Module):
+        super().__init__()
+        self.planner = planner
+
+    def _make_timesteps(self, current_actions: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(current_actions[:, 0, 0], dtype=torch.int32) + timestep.to(torch.int32)
+
+    def _denoise_step(
+        self,
+        current_actions: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        history_embeds: torch.Tensor,
+        ego_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        planner = self.planner
+        action_features = planner.action_encoder(current_actions, timesteps)
+        if hasattr(planner, "position_embedding"):
+            position_ids = torch.arange(planner.config.action_horizon, device=current_actions.device)
+            action_features = action_features + planner.position_embedding(position_ids)
+
+        vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, planner.config.action_horizon, 1)
+        fused_input = planner.fusion_projector(
+            torch.cat((history_embeds, vl_embeds_mean, action_features), dim=2)
+        )
+        model_output = planner.model(fused_input, vl_embeds, ego_embeds, timesteps)
+        return planner.action_decoder(model_output)
+
+    def _ddim_mean(
+        self,
+        current_actions: torch.Tensor,
+        model_prediction: torch.Tensor,
+        schedule_index: int,
+    ) -> torch.Tensor:
+        planner = self.planner
+        dtype = current_actions.dtype
+        alpha_t = planner.ddim_alphas[schedule_index].to(dtype=dtype).view(1, 1, 1)
+        sqrt_one_minus_alpha_t = planner.ddim_sqrt_one_minus_alphas[schedule_index].to(dtype=dtype).view(1, 1, 1)
+        x_recon = (current_actions - sqrt_one_minus_alpha_t * model_prediction.to(dtype=dtype)) / torch.sqrt(alpha_t)
+
+        denoised_clip_value = getattr(planner, "denoised_clip_value", 1.0)
+        x_recon = torch.clamp(x_recon, -denoised_clip_value, denoised_clip_value)
+
+        alpha_prev = planner.ddim_alphas_prev[schedule_index].to(dtype=dtype).view(1, 1, 1)
+        pred_noise = (current_actions - torch.sqrt(alpha_t) * x_recon) / sqrt_one_minus_alpha_t
+        eps_clip_value = getattr(planner, "eps_clip_value", None)
+        if eps_clip_value is not None:
+            pred_noise = torch.clamp(pred_noise, -eps_clip_value, eps_clip_value)
+
+        pred_dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_noise
+        return torch.sqrt(alpha_prev) * x_recon + pred_dir_xt
+
+    def _flow_step(
+        self,
+        current_actions: torch.Tensor,
+        vl_embeds: torch.Tensor,
+        history_embeds: torch.Tensor,
+        ego_embeds: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+        planner = self.planner
+        bucket_index = int(
+            step
+            / planner.config.num_inference_steps
+            * planner.config.flow_cfg.num_timestep_buckets
+        )
+        timestep = planner.ddim_t.new_tensor(bucket_index) if hasattr(planner, "ddim_t") else torch.tensor(
+            bucket_index,
+            device=current_actions.device,
+            dtype=torch.int32,
+        )
+        timesteps = self._make_timesteps(current_actions, timestep)
+        model_prediction = self._denoise_step(
+            current_actions,
+            vl_embeds,
+            history_embeds,
+            ego_embeds,
+            timesteps,
+        )
+        if planner.config.flow_cfg.mean_variance_net:
+            model_prediction = model_prediction.chunk(2, dim=-1)[0]
+        return current_actions + (1.0 / planner.config.num_inference_steps) * model_prediction.to(
+            dtype=current_actions.dtype
+        )
+
+    def forward(
+        self,
+        vl_features: torch.Tensor,
+        his_traj: torch.Tensor,
+        status_feature: torch.Tensor,
+        init_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        planner = self.planner
+        vl_embeds = planner.feature_encoder(vl_features)
+        history_embeds = planner.his_traj_encoder(his_traj.unsqueeze(1)).repeat(
+            1,
+            planner.config.action_horizon,
+            1,
+        )
+        ego_embeds = planner.ego_status_encoder(status_feature)
+
+        current_actions = init_actions
+        if planner.config.sampling_method == "flow":
+            for step in range(planner.config.num_inference_steps):
+                current_actions = self._flow_step(
+                    current_actions,
+                    vl_embeds,
+                    history_embeds,
+                    ego_embeds,
+                    step,
+                )
+        elif planner.config.sampling_method == "ddim":
+            for step_index in range(planner.ddim_steps):
+                timesteps = self._make_timesteps(current_actions, planner.ddim_t[step_index])
+                model_prediction = self._denoise_step(
+                    current_actions,
+                    vl_embeds,
+                    history_embeds,
+                    ego_embeds,
+                    timesteps,
+                )
+                current_actions = self._ddim_mean(current_actions, model_prediction, step_index)
+        else:
+            raise NotImplementedError("The full diffusion TRT export supports only 'ddim' and 'flow'.")
+
+        final_action_clip_value = getattr(planner, "final_action_clip_value", 1.0)
+        if final_action_clip_value is not None:
+            current_actions = torch.clamp(current_actions, -final_action_clip_value, final_action_clip_value)
+        return planner.denorm_odo(current_actions)
 
 
 @dataclass
@@ -527,20 +662,54 @@ def _diffusion_metadata_matches(
     checkpoint_path: Path,
     max_vl_seq_len: int,
     sampling_method: str,
+    engine_kind: str = "denoising_step",
+    metadata_path: Path = DIFFUSION_METADATA,
+    plan_path: Path = DIFFUSION_PLAN,
 ) -> bool:
-    if not DIFFUSION_PLAN.exists() or not DIFFUSION_METADATA.exists():
+    if not plan_path.exists() or not metadata_path.exists():
         return False
 
     try:
-        metadata = json.loads(DIFFUSION_METADATA.read_text())
+        metadata = json.loads(metadata_path.read_text())
     except Exception:
         return False
 
     return (
         metadata.get("engine_interface_version") == DIFFUSION_ENGINE_INTERFACE_VERSION
+        and metadata.get("engine_kind", "denoising_step") == engine_kind
         and metadata.get("checkpoint_path") == str(checkpoint_path)
         and metadata.get("max_vl_seq_len") == max_vl_seq_len
         and metadata.get("sampling_method") == sampling_method
+    )
+
+
+def _write_diffusion_metadata(
+    *,
+    metadata_path: Path,
+    checkpoint_path: Path,
+    max_vl_seq_len: int,
+    sampling_method: str,
+    engine_kind: str,
+    spec: _DiffusionPlannerSpec,
+) -> None:
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "engine_interface_version": DIFFUSION_ENGINE_INTERFACE_VERSION,
+                "engine_kind": engine_kind,
+                "checkpoint_path": str(checkpoint_path),
+                "max_vl_seq_len": max_vl_seq_len,
+                "sampling_method": sampling_method,
+                "feature_dim": spec.feature_dim,
+                "input_embedding_dim": spec.input_embedding_dim,
+                "his_traj_dim": spec.his_traj_dim,
+                "status_feature_dim": spec.status_feature_dim,
+                "action_horizon": spec.action_horizon,
+                "action_dim": spec.action_dim,
+                "model_prediction_dim": spec.model_prediction_dim,
+            },
+            indent=2,
+        )
     )
 
 
@@ -667,6 +836,7 @@ def export_diffusion_onnx(
         checkpoint_path=resolved_checkpoint,
         max_vl_seq_len=max_vl_seq_len,
         sampling_method=sampling_method,
+        engine_kind="denoising_step",
     ) and DIFFUSION_ONNX.exists():
         return DIFFUSION_ONNX
 
@@ -733,23 +903,13 @@ def export_diffusion_onnx(
             },
         )
 
-    DIFFUSION_METADATA.write_text(
-        json.dumps(
-            {
-                "engine_interface_version": DIFFUSION_ENGINE_INTERFACE_VERSION,
-                "checkpoint_path": str(resolved_checkpoint),
-                "max_vl_seq_len": max_vl_seq_len,
-                "sampling_method": sampling_method,
-                "feature_dim": spec.feature_dim,
-                "input_embedding_dim": spec.input_embedding_dim,
-                "his_traj_dim": spec.his_traj_dim,
-                "status_feature_dim": spec.status_feature_dim,
-                "action_horizon": spec.action_horizon,
-                "action_dim": spec.action_dim,
-                "model_prediction_dim": spec.model_prediction_dim,
-            },
-            indent=2,
-        )
+    _write_diffusion_metadata(
+        metadata_path=DIFFUSION_METADATA,
+        checkpoint_path=resolved_checkpoint,
+        max_vl_seq_len=max_vl_seq_len,
+        sampling_method=sampling_method,
+        engine_kind="denoising_step",
+        spec=spec,
     )
     return DIFFUSION_ONNX
 
@@ -765,6 +925,7 @@ def build_diffusion_trt_engine(
         checkpoint_path=resolved_checkpoint,
         max_vl_seq_len=max_vl_seq_len,
         sampling_method=sampling_method,
+        engine_kind="denoising_step",
     ) and DIFFUSION_PLAN.exists():
         return DIFFUSION_PLAN
 
@@ -829,6 +990,173 @@ def build_diffusion_trt_engine(
         raise RuntimeError("TensorRT failed to build the diffusion planner engine")
     DIFFUSION_PLAN.write_bytes(bytes(serialized))
     return DIFFUSION_PLAN
+
+
+def export_full_diffusion_onnx(
+    *,
+    max_vl_seq_len: int = 2800,
+    checkpoint_path: str | Path | None = None,
+    sampling_method: str = "ddim",
+) -> Path:
+    resolved_checkpoint = _resolve_diffusion_checkpoint(checkpoint_path)
+    if _diffusion_metadata_matches(
+        checkpoint_path=resolved_checkpoint,
+        max_vl_seq_len=max_vl_seq_len,
+        sampling_method=sampling_method,
+        engine_kind="full_diffusion",
+        metadata_path=DIFFUSION_FULL_METADATA,
+        plan_path=DIFFUSION_FULL_PLAN,
+    ) and DIFFUSION_FULL_ONNX.exists():
+        return DIFFUSION_FULL_ONNX
+
+    DIFFUSION_DIR.mkdir(parents=True, exist_ok=True)
+    planner, spec = _load_diffusion_planner_from_checkpoint(
+        resolved_checkpoint,
+        sampling_method=sampling_method,
+    )
+    _disable_compiled_modulate_methods_for_export(planner)
+    wrapper = DiffusionFullPlannerWrapper(planner).eval().cuda()
+    example_seq_len = min(max_vl_seq_len, max(spec.action_horizon, 256))
+    example_vl_features = torch.zeros(
+        1,
+        example_seq_len,
+        spec.feature_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_his_traj = torch.zeros(
+        1,
+        spec.his_traj_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_status_feature = torch.zeros(
+        1,
+        spec.status_feature_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    example_init_actions = torch.zeros(
+        1,
+        spec.action_horizon,
+        spec.action_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+
+    with torch.inference_mode():
+        torch.onnx.export(
+            wrapper,
+            (
+                example_vl_features,
+                example_his_traj,
+                example_status_feature,
+                example_init_actions,
+            ),
+            str(DIFFUSION_FULL_ONNX),
+            input_names=["vl_features", "his_traj", "status_feature", "init_actions"],
+            output_names=["pred_traj"],
+            opset_version=18,
+            dynamo=False,
+            external_data=True,
+            do_constant_folding=False,
+            dynamic_axes={
+                "vl_features": {0: "batch", 1: "vl_seq_len"},
+                "his_traj": {0: "batch"},
+                "status_feature": {0: "batch"},
+                "init_actions": {0: "batch"},
+                "pred_traj": {0: "batch"},
+            },
+        )
+
+    _write_diffusion_metadata(
+        metadata_path=DIFFUSION_FULL_METADATA,
+        checkpoint_path=resolved_checkpoint,
+        max_vl_seq_len=max_vl_seq_len,
+        sampling_method=sampling_method,
+        engine_kind="full_diffusion",
+        spec=spec,
+    )
+    return DIFFUSION_FULL_ONNX
+
+
+def build_full_diffusion_trt_engine(
+    *,
+    max_vl_seq_len: int = 2800,
+    checkpoint_path: str | Path | None = None,
+    sampling_method: str = "ddim",
+) -> Path:
+    resolved_checkpoint = _resolve_diffusion_checkpoint(checkpoint_path)
+    if _diffusion_metadata_matches(
+        checkpoint_path=resolved_checkpoint,
+        max_vl_seq_len=max_vl_seq_len,
+        sampling_method=sampling_method,
+        engine_kind="full_diffusion",
+        metadata_path=DIFFUSION_FULL_METADATA,
+        plan_path=DIFFUSION_FULL_PLAN,
+    ) and DIFFUSION_FULL_PLAN.exists():
+        return DIFFUSION_FULL_PLAN
+
+    export_full_diffusion_onnx(
+        max_vl_seq_len=max_vl_seq_len,
+        checkpoint_path=resolved_checkpoint,
+        sampling_method=sampling_method,
+    )
+    _, spec = _load_diffusion_planner_from_checkpoint(
+        resolved_checkpoint,
+        sampling_method=sampling_method,
+    )
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(DIFFUSION_DIR)
+        with open(DIFFUSION_FULL_ONNX, "rb") as handle:
+            ok = parser.parse(handle.read())
+        if not ok:
+            errors = [str(parser.get_error(index)) for index in range(parser.num_errors)]
+            raise RuntimeError("Failed to parse full diffusion ONNX with TensorRT\n" + "\n".join(errors))
+
+        config = builder.create_builder_config()
+        config.set_flag(trt.BuilderFlag.FP16)
+        profile = builder.create_optimization_profile()
+        profile.set_shape(
+            "vl_features",
+            (1, 1, spec.feature_dim),
+            (1, min(max_vl_seq_len, max(spec.action_horizon, 256)), spec.feature_dim),
+            (1, max_vl_seq_len, spec.feature_dim),
+        )
+        profile.set_shape(
+            "his_traj",
+            (1, spec.his_traj_dim),
+            (1, spec.his_traj_dim),
+            (1, spec.his_traj_dim),
+        )
+        profile.set_shape(
+            "status_feature",
+            (1, spec.status_feature_dim),
+            (1, spec.status_feature_dim),
+            (1, spec.status_feature_dim),
+        )
+        profile.set_shape(
+            "init_actions",
+            (1, spec.action_horizon, spec.action_dim),
+            (1, spec.action_horizon, spec.action_dim),
+            (1, spec.action_horizon, spec.action_dim),
+        )
+        config.add_optimization_profile(profile)
+        serialized = builder.build_serialized_network(network, config)
+    finally:
+        os.chdir(cwd)
+
+    if serialized is None:
+        raise RuntimeError("TensorRT failed to build the full diffusion planner engine")
+    DIFFUSION_FULL_PLAN.write_bytes(bytes(serialized))
+    return DIFFUSION_FULL_PLAN
 
 
 def build_language_trtllm_engine(
