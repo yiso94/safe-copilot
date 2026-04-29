@@ -407,7 +407,7 @@ class ReCogDriveAgent(AbstractAgent):
                 last_hidden_state,
                 action_inputs,
                 init_actions=init_actions,
-                deterministic=True,
+                deterministic=deterministic,
             )
 
         if self.use_diffusion_trt:

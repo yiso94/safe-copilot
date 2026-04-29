@@ -117,10 +117,19 @@ class DiffusionFullPlannerWrapper(torch.nn.Module):
         model_output = planner.model(fused_input, vl_embeds, ego_embeds, timesteps)
         return planner.action_decoder(model_output)
 
-    def _ddim_mean(
+    def _eta_value(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        eta_module = getattr(self.planner, "eta", None)
+        if eta_module is None:
+            return torch.ones(1, 1, 1, device=device, dtype=dtype)
+        eta_logit = eta_module.eta_logit.to(device=device, dtype=dtype).view(1, 1, 1)
+        eta_normalized = torch.tanh(eta_logit)
+        return 0.5 * (eta_normalized + 1) * (eta_module.max - eta_module.min) + eta_module.min
+
+    def _ddim_sample(
         self,
         current_actions: torch.Tensor,
         model_prediction: torch.Tensor,
+        noise_sample: torch.Tensor,
         schedule_index: int,
     ) -> torch.Tensor:
         planner = self.planner
@@ -138,8 +147,24 @@ class DiffusionFullPlannerWrapper(torch.nn.Module):
         if eps_clip_value is not None:
             pred_noise = torch.clamp(pred_noise, -eps_clip_value, eps_clip_value)
 
-        pred_dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_noise
-        return torch.sqrt(alpha_prev) * x_recon + pred_dir_xt
+        eta = self._eta_value(dtype, current_actions.device)
+        sigma = eta * torch.sqrt(
+            ((1.0 - alpha_prev) / (1.0 - alpha_t)) * (1.0 - alpha_t / alpha_prev)
+        )
+        sigma = torch.clamp(sigma, min=1e-10)
+
+        pred_dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_prev - sigma**2, min=0.0)) * pred_noise
+        model_mean = torch.sqrt(alpha_prev) * x_recon + pred_dir_xt
+
+        eval_min_sampling_denoising_std = getattr(planner, "eval_min_sampling_denoising_std", 0.0001)
+        eval_randn_clip_value = getattr(planner, "eval_randn_clip_value", 1.0)
+        std = torch.clamp(sigma.to(dtype=dtype), min=eval_min_sampling_denoising_std)
+        noise_sample = torch.clamp(
+            noise_sample.to(dtype=dtype),
+            -eval_randn_clip_value,
+            eval_randn_clip_value,
+        )
+        return model_mean + std * noise_sample
 
     def _flow_step(
         self,
@@ -180,6 +205,7 @@ class DiffusionFullPlannerWrapper(torch.nn.Module):
         his_traj: torch.Tensor,
         status_feature: torch.Tensor,
         init_actions: torch.Tensor,
+        noise_samples: torch.Tensor,
     ) -> torch.Tensor:
         planner = self.planner
         vl_embeds = planner.feature_encoder(vl_features)
@@ -210,7 +236,12 @@ class DiffusionFullPlannerWrapper(torch.nn.Module):
                     ego_embeds,
                     timesteps,
                 )
-                current_actions = self._ddim_mean(current_actions, model_prediction, step_index)
+                current_actions = self._ddim_sample(
+                    current_actions,
+                    model_prediction,
+                    noise_samples[:, step_index],
+                    step_index,
+                )
         else:
             raise NotImplementedError("The full diffusion TRT export supports only 'ddim' and 'flow'.")
 
@@ -665,6 +696,7 @@ def _diffusion_metadata_matches(
     engine_kind: str = "denoising_step",
     metadata_path: Path = DIFFUSION_METADATA,
     plan_path: Path = DIFFUSION_PLAN,
+    deterministic: bool | None = None,
 ) -> bool:
     if not plan_path.exists() or not metadata_path.exists():
         return False
@@ -674,13 +706,16 @@ def _diffusion_metadata_matches(
     except Exception:
         return False
 
-    return (
+    matches = (
         metadata.get("engine_interface_version") == DIFFUSION_ENGINE_INTERFACE_VERSION
         and metadata.get("engine_kind", "denoising_step") == engine_kind
         and metadata.get("checkpoint_path") == str(checkpoint_path)
         and metadata.get("max_vl_seq_len") == max_vl_seq_len
         and metadata.get("sampling_method") == sampling_method
     )
+    if deterministic is not None:
+        matches = matches and metadata.get("deterministic") is deterministic
+    return matches
 
 
 def _write_diffusion_metadata(
@@ -690,13 +725,17 @@ def _write_diffusion_metadata(
     max_vl_seq_len: int,
     sampling_method: str,
     engine_kind: str,
+    deterministic: bool | None,
     spec: _DiffusionPlannerSpec,
+    ddim_steps: int | None = None,
 ) -> None:
     metadata_path.write_text(
         json.dumps(
             {
                 "engine_interface_version": DIFFUSION_ENGINE_INTERFACE_VERSION,
                 "engine_kind": engine_kind,
+                "deterministic": deterministic,
+                "ddim_steps": ddim_steps,
                 "checkpoint_path": str(checkpoint_path),
                 "max_vl_seq_len": max_vl_seq_len,
                 "sampling_method": sampling_method,
@@ -909,6 +948,8 @@ def export_diffusion_onnx(
         max_vl_seq_len=max_vl_seq_len,
         sampling_method=sampling_method,
         engine_kind="denoising_step",
+        deterministic=None,
+        ddim_steps=None,
         spec=spec,
     )
     return DIFFUSION_ONNX
@@ -934,7 +975,7 @@ def build_diffusion_trt_engine(
         checkpoint_path=resolved_checkpoint,
         sampling_method=sampling_method,
     )
-    _, spec = _load_diffusion_planner_from_checkpoint(
+    planner, spec = _load_diffusion_planner_from_checkpoint(
         resolved_checkpoint,
         sampling_method=sampling_method,
     )
@@ -1006,6 +1047,7 @@ def export_full_diffusion_onnx(
         engine_kind="full_diffusion",
         metadata_path=DIFFUSION_FULL_METADATA,
         plan_path=DIFFUSION_FULL_PLAN,
+        deterministic=False,
     ) and DIFFUSION_FULL_ONNX.exists():
         return DIFFUSION_FULL_ONNX
 
@@ -1043,6 +1085,14 @@ def export_full_diffusion_onnx(
         device="cuda",
         dtype=torch.float16,
     )
+    example_noise_samples = torch.zeros(
+        1,
+        planner.ddim_steps,
+        spec.action_horizon,
+        spec.action_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
 
     with torch.inference_mode():
         torch.onnx.export(
@@ -1052,9 +1102,10 @@ def export_full_diffusion_onnx(
                 example_his_traj,
                 example_status_feature,
                 example_init_actions,
+                example_noise_samples,
             ),
             str(DIFFUSION_FULL_ONNX),
-            input_names=["vl_features", "his_traj", "status_feature", "init_actions"],
+            input_names=["vl_features", "his_traj", "status_feature", "init_actions", "noise_samples"],
             output_names=["pred_traj"],
             opset_version=18,
             dynamo=False,
@@ -1065,6 +1116,7 @@ def export_full_diffusion_onnx(
                 "his_traj": {0: "batch"},
                 "status_feature": {0: "batch"},
                 "init_actions": {0: "batch"},
+                "noise_samples": {0: "batch"},
                 "pred_traj": {0: "batch"},
             },
         )
@@ -1075,6 +1127,8 @@ def export_full_diffusion_onnx(
         max_vl_seq_len=max_vl_seq_len,
         sampling_method=sampling_method,
         engine_kind="full_diffusion",
+        deterministic=False,
+        ddim_steps=planner.ddim_steps,
         spec=spec,
     )
     return DIFFUSION_FULL_ONNX
@@ -1094,6 +1148,7 @@ def build_full_diffusion_trt_engine(
         engine_kind="full_diffusion",
         metadata_path=DIFFUSION_FULL_METADATA,
         plan_path=DIFFUSION_FULL_PLAN,
+        deterministic=False,
     ) and DIFFUSION_FULL_PLAN.exists():
         return DIFFUSION_FULL_PLAN
 
@@ -1102,7 +1157,7 @@ def build_full_diffusion_trt_engine(
         checkpoint_path=resolved_checkpoint,
         sampling_method=sampling_method,
     )
-    _, spec = _load_diffusion_planner_from_checkpoint(
+    planner, spec = _load_diffusion_planner_from_checkpoint(
         resolved_checkpoint,
         sampling_method=sampling_method,
     )
@@ -1147,6 +1202,12 @@ def build_full_diffusion_trt_engine(
             (1, spec.action_horizon, spec.action_dim),
             (1, spec.action_horizon, spec.action_dim),
             (1, spec.action_horizon, spec.action_dim),
+        )
+        profile.set_shape(
+            "noise_samples",
+            (1, planner.ddim_steps, spec.action_horizon, spec.action_dim),
+            (1, planner.ddim_steps, spec.action_horizon, spec.action_dim),
+            (1, planner.ddim_steps, spec.action_horizon, spec.action_dim),
         )
         config.add_optimization_profile(profile)
         serialized = builder.build_serialized_network(network, config)

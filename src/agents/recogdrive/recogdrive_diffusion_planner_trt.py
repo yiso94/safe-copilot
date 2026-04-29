@@ -89,6 +89,8 @@ class ReCogDriveDiffusionPlannerTRT:
         self.engine_kind = str(metadata.get("engine_kind", "denoising_step"))
         if self.engine_kind not in {"denoising_step", "full_diffusion"}:
             raise RuntimeError(f"Unsupported diffusion TRT engine_kind={self.engine_kind!r}")
+        self.deterministic = bool(metadata.get("deterministic", True))
+        self.ddim_steps = int(metadata.get("ddim_steps") or 5)
         self.action_horizon = int(metadata.get("action_horizon", 8))
         self.action_dim = int(metadata.get("action_dim", 3))
         self.his_traj_dim = int(metadata.get("his_traj_dim", 12))
@@ -284,6 +286,7 @@ class ReCogDriveDiffusionPlannerTRT:
         his_traj: torch.Tensor,
         status_feature: torch.Tensor,
         init_actions: torch.Tensor,
+        noise_samples: torch.Tensor | None = None,
     ) -> torch.Tensor:
         vl_features = vl_features.to(device=self.device, dtype=torch.float16).contiguous()
         his_traj = his_traj.to(device=self.device, dtype=torch.float16).contiguous()
@@ -294,6 +297,11 @@ class ReCogDriveDiffusionPlannerTRT:
         self._context.set_input_shape("his_traj", tuple(his_traj.shape))
         self._context.set_input_shape("status_feature", tuple(status_feature.shape))
         self._context.set_input_shape("init_actions", tuple(init_actions.shape))
+        if not self.deterministic:
+            if noise_samples is None:
+                raise ValueError("Stochastic full diffusion TRT engine requires noise_samples.")
+            noise_samples = noise_samples.to(device=self.device, dtype=torch.float16).contiguous()
+            self._context.set_input_shape("noise_samples", tuple(noise_samples.shape))
         output_shape = tuple(self._context.get_tensor_shape("pred_traj"))
         output_dtype = _torch_dtype_from_trt(self._engine.get_tensor_dtype("pred_traj"))
         pred_traj = torch.empty(output_shape, device=self.device, dtype=output_dtype)
@@ -302,6 +310,8 @@ class ReCogDriveDiffusionPlannerTRT:
         self._context.set_tensor_address("his_traj", his_traj.data_ptr())
         self._context.set_tensor_address("status_feature", status_feature.data_ptr())
         self._context.set_tensor_address("init_actions", init_actions.data_ptr())
+        if not self.deterministic:
+            self._context.set_tensor_address("noise_samples", noise_samples.data_ptr())
         self._context.set_tensor_address("pred_traj", pred_traj.data_ptr())
 
         ok = self._context.execute_async_v3(torch.cuda.current_stream(self.device).cuda_stream)
@@ -340,9 +350,17 @@ class ReCogDriveDiffusionPlannerTRT:
         action_input: BatchFeature,
         *,
         init_actions: torch.Tensor | None = None,
-        deterministic: bool = True,
+        deterministic: bool | None = None,
     ) -> BatchFeature:
-        if not deterministic:
+        if deterministic is None:
+            deterministic = self.deterministic
+        if self.engine_kind == "full_diffusion" and deterministic != self.deterministic:
+            raise ValueError(
+                "Requested deterministic mode does not match the full diffusion TRT engine metadata: "
+                f"requested deterministic={deterministic}, engine deterministic={self.deterministic}. "
+                "Rebuild the engine for the desired sampling mode."
+            )
+        if self.engine_kind != "full_diffusion" and not deterministic:
             raise NotImplementedError(
                 "The TensorRT diffusion planner runtime currently supports deterministic inference only. "
                 "Pass deterministic=True and provide init_actions if you need a specific starting trajectory."
@@ -357,11 +375,22 @@ class ReCogDriveDiffusionPlannerTRT:
 
         with torch.inference_mode():
             if self.engine_kind == "full_diffusion":
+                noise_samples = None
+                if not self.deterministic:
+                    noise_samples = torch.randn(
+                        init_actions.shape[0],
+                        self.ddim_steps,
+                        self.action_horizon,
+                        self.action_dim,
+                        device=self.device,
+                        dtype=torch.float16,
+                    )
                 pred_traj = self._run_full_diffusion(
                     vl_features,
                     his_traj,
                     status_feature,
                     init_actions,
+                    noise_samples,
                 )
                 torch.cuda.synchronize(self.device)
                 return BatchFeature(data={"pred_traj": pred_traj.float()})

@@ -146,20 +146,30 @@ class ONNX_TRT:
                 device="cuda",
                 dtype=torch.float16,
             )
+            example_noise_samples = torch.zeros(
+                1,
+                planner.ddim_steps,
+                spec.action_horizon,
+                spec.action_dim,
+                device="cuda",
+                dtype=torch.float16,
+            )
 
             export_args = (
                 example_vl_features,
                 example_his_traj,
                 example_status_feature,
                 example_init_actions,
+                example_noise_samples,
             )
-            input_names = ["vl_features", "his_traj", "status_feature", "init_actions"]
+            input_names = ["vl_features", "his_traj", "status_feature", "init_actions", "noise_samples"]
             output_names = ["pred_traj"]
             dynamic_axes = {
                 "vl_features": {0: "batch", 1: "vl_seq_len"},
                 "his_traj": {0: "batch"},
                 "status_feature": {0: "batch"},
                 "init_actions": {0: "batch"},
+                "noise_samples": {0: "batch"},
                 "pred_traj": {0: "batch"},
             }
         else:
@@ -185,6 +195,8 @@ class ONNX_TRT:
                     {
                         "engine_interface_version": DIFFUSION_ENGINE_INTERFACE_VERSION,
                         "engine_kind": engine_kind,
+                        "deterministic": False if engine_kind == "full_diffusion" else None,
+                        "ddim_steps": planner.ddim_steps if engine_kind == "full_diffusion" else None,
                         "checkpoint_path": str(Path(checkpoint_path).expanduser().resolve()),
                         "max_vl_seq_len": self.max_vl_seq_len,
                         "sampling_method": sampling_method,
@@ -302,6 +314,16 @@ class ONNX_TRT:
                     [minBS, action_horizon, action_dim],
                     [optBS, action_horizon, action_dim],
                     [maxBS, action_horizon, action_dim],
+                )
+            elif input_name == "noise_samples":
+                step_count = input_shape[1]
+                action_horizon = input_shape[2]
+                action_dim = input_shape[3]
+                profile.set_shape(
+                    input_name,
+                    [minBS, step_count, action_horizon, action_dim],
+                    [optBS, step_count, action_horizon, action_dim],
+                    [maxBS, step_count, action_horizon, action_dim],
                 )
             else:
                 raise ValueError(f"Unexpected ONNX input name: {input_name}")
